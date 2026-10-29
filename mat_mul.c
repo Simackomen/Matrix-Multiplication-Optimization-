@@ -6,6 +6,8 @@
  * - Data structure: Matrices are stored as flat 1D arrays for better cache locality, when compared to the naive 
  *                   array-of-pointers implementation. 
  * 
+ * - Compile with: clang -O3 mat_mul.c -o mat_mul.o
+ * - Run with: ./mat_mul.o
  * 
  ***********************************************************************************************************************/
 
@@ -349,6 +351,123 @@ static inline double* matmul_strass(double *A, double *B, size_t n) {
     return strassen(A, n, B, n, n);
 }
 
+/******************************************* CACHE-OBLIVIOUS PARTITION ********************************************/
+
+// Recursively partitions A (n x n, standard row/col layout) into T,
+// writing 1x1 elements in recursive block order.
+// idx tracks the next write position in T across recursive calls.
+static inline void partition(const double *A, double *T, size_t n,
+                      size_t x1, size_t y1, size_t x2, size_t y2,
+                      size_t *idx)
+{
+    size_t xnu = (x1 + x2) / 2;
+    size_t ynu = (y1 + y2) / 2;
+
+    if (xnu > x1) {
+        partition(A, T, n, x1,  y1,  xnu, ynu, idx);  // TL
+        partition(A, T, n, xnu, y1,  x2,  ynu, idx);  // TR
+        partition(A, T, n, x1,  ynu, xnu, y2,  idx);  // BL
+        partition(A, T, n, xnu, ynu, x2,  y2,  idx);  // BR
+    } else {
+        T[*idx] = A[n * y1 + x1];
+        (*idx)++;
+    }
+}
+
+// Convenience wrapper: transforms A (n x n) into recursive-block layout T.
+// T must already be allocated with n*n doubles.
+void to_recursive_layout(const double *A, double *T, size_t n)
+{
+    size_t idx = 0;
+    partition(A, T, n, 0, 0, n, n, &idx);
+}
+
+static void multiply_4x4_block(const double *A, const double *B, double *C)
+{
+    C[0]  += A[0]*B[0]  + A[2]*B[1]  + A[8]*B[4]   + A[10]*B[5];
+    C[2]  += A[0]*B[2]  + A[2]*B[3]  + A[8]*B[6]   + A[10]*B[7];
+    C[8]  += A[0]*B[8]  + A[2]*B[9]  + A[8]*B[12]  + A[10]*B[13];
+    C[10] += A[0]*B[10] + A[2]*B[11] + A[8]*B[14]  + A[10]*B[15];
+
+    C[1]  += A[1]*B[0]  + A[3]*B[1]  + A[9]*B[4]   + A[11]*B[5];
+    C[3]  += A[1]*B[2]  + A[3]*B[3]  + A[9]*B[6]   + A[11]*B[7];
+    C[9]  += A[1]*B[8]  + A[3]*B[9]  + A[9]*B[12]  + A[11]*B[13];
+    C[11] += A[1]*B[10] + A[3]*B[11] + A[9]*B[14]  + A[11]*B[15];
+
+    C[4]  += A[4]*B[0]  + A[6]*B[1]  + A[12]*B[4]  + A[14]*B[5];
+    C[6]  += A[4]*B[2]  + A[6]*B[3]  + A[12]*B[6]  + A[14]*B[7];
+    C[12] += A[4]*B[8]  + A[6]*B[9]  + A[12]*B[12] + A[14]*B[13];
+    C[14] += A[4]*B[10] + A[6]*B[11] + A[12]*B[14] + A[14]*B[15];
+
+    C[5]  += A[5]*B[0]  + A[7]*B[1]  + A[13]*B[4]  + A[15]*B[5];
+    C[7]  += A[5]*B[2]  + A[7]*B[3]  + A[13]*B[6]  + A[15]*B[7];
+    C[13] += A[5]*B[8]  + A[7]*B[9]  + A[13]*B[12] + A[15]*B[13];
+    C[15] += A[5]*B[10] + A[7]*B[11] + A[13]*B[14] + A[15]*B[15];
+}
+
+static void multiply_8x8_block(const double *A, const double *B, double *C)
+{
+    // h = 4, so each quadrant is a 4x4 = 16-element contiguous block
+    const double *A11 = A,    *A12 = A + 16, *A21 = A + 32, *A22 = A + 48;
+    const double *B11 = B,    *B12 = B + 16, *B21 = B + 32, *B22 = B + 48;
+    double       *C11 = C,    *C12 = C + 16, *C21 = C + 32, *C22 = C + 48;
+
+    multiply_4x4_block(A11, B11, C11);
+    multiply_4x4_block(A12, B21, C11);   // C11 += A12*B21
+
+    multiply_4x4_block(A11, B12, C12);
+    multiply_4x4_block(A12, B22, C12);
+
+    multiply_4x4_block(A21, B11, C21);
+    multiply_4x4_block(A22, B21, C21);
+
+    multiply_4x4_block(A21, B12, C22);
+    multiply_4x4_block(A22, B22, C22);
+}
+
+void recursive_multiply(const double *A, const double *B, double *C, size_t n)
+{
+    if (n == 8) {
+        multiply_8x8_block(A, B, C);
+        return;
+    }
+    if (n == 4) {
+        multiply_4x4_block(A, B, C);
+        return;
+    }
+
+    size_t h = n / 2;
+    size_t block = h * h;
+
+    const double *A11=A, *A12=A+block, *A21=A+2*block, *A22=A+3*block;
+    const double *B11=B, *B12=B+block, *B21=B+2*block, *B22=B+3*block;
+    double       *C11=C, *C12=C+block, *C21=C+2*block, *C22=C+3*block;
+
+    recursive_multiply(A11,B11,C11,h);
+    recursive_multiply(A12,B21,C11,h);
+
+    recursive_multiply(A11,B12,C12,h);
+    recursive_multiply(A12,B22,C12,h);
+
+    recursive_multiply(A21,B11,C21,h);
+    recursive_multiply(A22,B21,C21,h);
+
+    recursive_multiply(A21,B12,C22,h);
+    recursive_multiply(A22,B22,C22,h);
+}
+
+static inline double* matmul_partition(double *A, double *B, size_t n)
+{
+    double *C = calloc(n * n, sizeof(double));
+    if (!C) {
+        return NULL;
+    }
+
+    recursive_multiply(A, B, C, n);
+
+    return C;
+}
+
 /******************************************* TIMING ALGORITHM ********************************************/
 
 // Function pointer type matching the signature of the algorithm to be timed
@@ -424,5 +543,7 @@ int main()
     printf("\nStrassen's recursive approach: \n");
     run_trials(matmul_strass);
 
+    printf("\nCache-oblivious recursive partitioning approach: \n");
+    run_trials(matmul_partition);
     return 0;
 }
